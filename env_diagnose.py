@@ -9,6 +9,7 @@ back with a consultant for a remediation proposal.
 
 Usage:
     python env_diagnose.py [project_dir] [--output DIR] [--json]
+    python env_diagnose.py [project_dir] --compare OLD_REPORT.json
 
 Default project_dir is the current working directory.
 """
@@ -22,19 +23,50 @@ import subprocess
 import sys
 import datetime
 
+TOOL_VERSION = "1.1.0"
+SCHEMA_VERSION = 2
+
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
 
 SEV_RANK = {"high": 0, "medium": 1, "low": 2, "info": 3}
 
-def finding(category, severity, title, detail="", advice=""):
+# Stable finding ID -> self-fix effort baseline (person-hours, rough).
+# IDs with a <suffix> part look up by the base ID before the colon.
+SELF_FIX_HOURS = {
+    "NO-AGENT-STACK": 0,
+    "DOCKER-IDLE": 0.5,
+    "KEYS-ENV-OK": 0,
+    "KEYS-NO-ENV": 1,             # locate keys, move to env/secret manager
+    "ENVFILE-WORLD-READABLE": 0.5,
+    "KEYS-HARDCODED": 3,          # move out of source + rotate committed keys
+    "OBS-NO-LOGGING": 4,          # structured logging per model call + alert
+    "OBS-NO-RETRY": 2,
+    "DATA-HTTP": 1,
+    "DATA-DOMAINS": 0,
+    "DATA-NO-ENDPOINTS": 0,
+    "COST-NO-TRACKING": 3,
+    "COST-INFO": 0,
+    "VCS-NO-GIT": 1,
+    "VCS-PROMPTS-NO-GIT": 1,
+}
+
+
+def fix_hours(fid):
+    base = fid.split(":", 1)[0]
+    return SELF_FIX_HOURS.get(base, 0)
+
+
+def finding(fid, category, severity, title, detail="", advice=""):
     return {
+        "id": fid,
         "category": category,
         "severity": severity,
         "title": title,
         "detail": detail,
         "advice": advice,
+        "self_fix_hours": fix_hours(fid),
     }
 
 def which(prog):
@@ -112,7 +144,7 @@ def check_platform(project_dir, pip, docker):
 
     if not found and not docker["containers"]:
         findings.append(finding(
-            "platform", "info",
+            "NO-AGENT-STACK", "platform", "info",
             "No agent/LLM stack detected in this Python environment",
             "No common agent frameworks (langchain, openai, anthropic, ...) "
             "found via pip, and no running Docker containers.",
@@ -120,7 +152,7 @@ def check_platform(project_dir, pip, docker):
             "run this tool there too — one report per deployment."))
     if docker["installed"] and not docker["containers"]:
         findings.append(finding(
-            "platform", "low",
+            "DOCKER-IDLE", "platform", "low",
             "Docker is installed but no containers are running",
             "", "If agents were deployed via Docker, confirm they are running; "
             "silent container exits are a common failure mode."))
@@ -155,14 +187,14 @@ def check_keys(project_dir, env):
     set_keys = [k for k in key_vars if k["set"]]
     if set_keys:
         findings.append(finding(
-            "keys", "info",
+            "KEYS-ENV-OK", "keys", "info",
             f"{len(set_keys)} model API key(s) found in environment variables",
             "Names only: " + ", ".join(k["name"] for k in set_keys),
             "Environment variables are the right place for keys. Make sure the "
             "processes that need them can read them, and nothing else can."))
     else:
         findings.append(finding(
-            "keys", "medium",
+            "KEYS-NO-ENV", "keys", "medium",
             "No model API keys detected in environment variables",
             "", "If agents call model APIs, keys may be hardcoded in scripts or "
             "config files — a leak risk. Move them to environment variables "
@@ -187,7 +219,7 @@ def check_keys(project_dir, env):
             env_hits.append(entry)
             if entry["world_readable"]:
                 findings.append(finding(
-                    "keys", "high",
+                    f"ENVFILE-WORLD-READABLE:{rel}", "keys", "high",
                     f"Secrets file '{rel}' is readable by other users on this machine",
                     "", "Restrict permissions: chmod 600 " + rel +
                     ". Anyone with an account on this host could read the keys."))
@@ -207,7 +239,7 @@ def check_keys(project_dir, env):
     facts["files_with_hardcoded_key_pattern"] = hardcoded
     if hardcoded:
         findings.append(finding(
-            "keys", "high",
+            "KEYS-HARDCODED", "keys", "high",
             f"{hardcoded} file(s) contain strings that look like hardcoded API keys",
             "Files scanned: %d (depth 2 under the project directory). Values are "
             "never extracted or included in this report." % scanned,
@@ -235,7 +267,7 @@ def check_observability(project_dir, pip, docker):
 
     if not has_logging and not monitoring_containers and not log_files:
         findings.append(finding(
-            "observability", "high",
+            "OBS-NO-LOGGING", "observability", "high",
             "No logging or monitoring detected for the agent stack",
             "", "When an agent fails silently you lose trust and money. Add "
             "structured logging for every model call (prompt size, latency, "
@@ -244,7 +276,7 @@ def check_observability(project_dir, pip, docker):
     facts["retry_lib"] = retry_hint
     if not retry_hint:
         findings.append(finding(
-            "observability", "medium",
+            "OBS-NO-RETRY", "observability", "medium",
             "No retry/backoff library detected",
             "", "Model APIs rate-limit and time out. Without retries with "
             "backoff, one busy hour can break your workflow."))
@@ -277,21 +309,21 @@ def check_data_boundary(project_dir):
     facts["insecure_http_endpoints"] = sorted(insecure)
     if insecure:
         findings.append(finding(
-            "data", "high",
+            "DATA-HTTP", "data", "high",
             f"{len(insecure)} non-HTTPS endpoint(s) referenced in configs",
             "Domains: " + ", ".join(sorted(insecure)),
             "Switch to HTTPS. Plain HTTP sends prompts and business data in "
             "the clear across the network."))
     if domains:
         findings.append(finding(
-            "data", "info",
+            "DATA-DOMAINS", "data", "info",
             f"{len(domains)} external service domain(s) referenced",
             "Domains: " + ", ".join(sorted(domains)[:20]),
             "Review this list: every domain is a place your prompts or data "
             "can travel to. Remove integrations you no longer use."))
     else:
         findings.append(finding(
-            "data", "low",
+            "DATA-NO-ENDPOINTS", "data", "low",
             "No external endpoints found in the scanned project files",
             "", "If agents call external APIs, configs may live outside the "
             "scanned directory — run this tool where the services actually run."))
@@ -307,14 +339,14 @@ def check_cost(pip):
     facts["usage_tracking_hint"] = has_usage
     if not has_usage:
         findings.append(finding(
-            "cost", "medium",
+            "COST-NO-TRACKING", "cost", "medium",
             "No token usage / cost tracking detected",
             "", "Add per-call token accounting (most model APIs return usage in "
             "the response). Log it per workflow so you can see cost per business "
             "process, not just a monthly bill."))
     else:
         findings.append(finding(
-            "cost", "info",
+            "COST-INFO", "cost", "info",
             "Model client libraries present — usage fields are available",
             "", "Make sure usage numbers are actually persisted per call; "
             "libraries return them but rarely store them."))
@@ -334,14 +366,14 @@ def check_version_control(project_dir):
     facts["prompt_like_files"] = [os.path.relpath(p, project_dir) for p in prompt_files[:20]]
     if not has_git:
         findings.append(finding(
-            "vcs", "medium",
+            "VCS-NO-GIT", "vcs", "medium",
             "Project directory is not a git repository",
             "", "Prompts, configs and agent logic change constantly. Without "
             "version control you cannot answer 'what changed when it broke'. "
             "Run: git init && git add -A && git commit -m init"))
     if prompt_files and not has_git:
         findings.append(finding(
-            "vcs", "medium",
+            "VCS-PROMPTS-NO-GIT", "vcs", "medium",
             f"{len(prompt_files)} prompt file(s) with no version control",
             "", "Treat prompts like code: track every change, keep the working "
             "version reviewable."))
@@ -373,11 +405,13 @@ def build_report(project_dir):
         all_findings.extend(f)
         facts.update(fa)
 
-    all_findings.sort(key=lambda x: SEV_RANK.get(x["severity"], 9))
+    all_findings.sort(key=lambda x: (SEV_RANK.get(x["severity"], 9), x.get("id", "")))
     summary = {s: sum(1 for f in all_findings if f["severity"] == s)
                for s in ("high", "medium", "low", "info")}
     return {
         "report_type": "agent_environment_diagnostic",
+        "tool_version": TOOL_VERSION,
+        "schema_version": SCHEMA_VERSION,
         "generated_at": facts["generated_at"],
         "summary": summary,
         "findings": all_findings,
@@ -388,11 +422,38 @@ def build_report(project_dir):
                  "proposal."),
     }
 
+def compare_reports(current, old_path):
+    """Diff two diagnostic reports by stable finding ID: new/resolved/persisting."""
+    with open(old_path, encoding="utf-8") as f:
+        old = json.load(f)
+
+    def idmap(rep):
+        return {f["id"]: f for f in rep.get("findings", []) if f.get("id")}
+
+    cur, oldm = idmap(current), idmap(old)
+    new_ids = sorted(set(cur) - set(oldm))
+    resolved_ids = sorted(set(oldm) - set(cur))
+    persist_ids = sorted(set(cur) & set(oldm))
+    sev_changed = [{"id": i, "from": oldm[i]["severity"], "to": cur[i]["severity"]}
+                   for i in persist_ids if oldm[i]["severity"] != cur[i]["severity"]]
+    return {
+        "compared_against": os.path.abspath(old_path),
+        "old_generated_at": old.get("generated_at"),
+        "new": [cur[i] for i in new_ids],
+        "resolved": [{"id": i, "severity": oldm[i]["severity"], "title": oldm[i]["title"]}
+                     for i in resolved_ids],
+        "persisting": [cur[i] for i in persist_ids],
+        "severity_changed": sev_changed,
+    }
+
+
 def render_markdown(report):
     lines = [
         "# Agent Environment Diagnostic Report",
         "",
-        "Generated: %s  |  Project: %s" % (report["generated_at"], report["facts"].get("project_dir", "")),
+        "Generated: %s  |  Project: %s  |  Tool: v%s (schema v%s)" % (
+            report["generated_at"], report["facts"].get("project_dir", ""),
+            report.get("tool_version", "?"), report.get("schema_version", "?")),
         "",
         "**Summary:** %d high · %d medium · %d low · %d info" % (
             report["summary"]["high"], report["summary"]["medium"],
@@ -402,22 +463,64 @@ def render_markdown(report):
         "",
     ]
     for f in report["findings"]:
+        hours = f.get("self_fix_hours")
+        hours_txt = " · self-fix ~%s h" % hours if hours else ""
         lines.append("### [%s] %s" % (f["severity"].upper(), f["title"]))
+        lines.append("- Finding ID: `%s`%s" % (f.get("id", "?"), hours_txt))
         if f["detail"]:
             lines.append("- %s" % f["detail"])
         if f["advice"]:
             lines.append("- **Advice:** %s" % f["advice"])
         lines.append("")
+    cmp_ = report.get("compare")
+    if cmp_:
+        lines += ["## Comparison with previous report", "",
+                  "- Baseline: `%s` (generated %s)" % (
+                      cmp_["compared_against"], cmp_.get("old_generated_at") or "unknown"), ""]
+        if cmp_["resolved"]:
+            lines.append("**Resolved:**")
+            for r in cmp_["resolved"]:
+                lines.append("- RESOLVED `%s` %s" % (r["id"], r["title"]))
+            lines.append("")
+        if cmp_["new"]:
+            lines.append("**New:**")
+            for n in cmp_["new"]:
+                lines.append("- NEW `%s` %s" % (n["id"], n["title"]))
+            lines.append("")
+        if cmp_["severity_changed"]:
+            lines.append("**Severity changed:**")
+            for s in cmp_["severity_changed"]:
+                lines.append("- CHANGED `%s`: %s -> %s" % (s["id"], s["from"], s["to"]))
+            lines.append("")
+        if cmp_["persisting"]:
+            lines.append("**Persisting** (not yet fixed, follow the advice):")
+            for p in cmp_["persisting"]:
+                lines.append("- `%s` %s" % (p["id"], p["title"]))
+            lines.append("")
+        if not (cmp_["resolved"] or cmp_["new"] or cmp_["severity_changed"] or cmp_["persisting"]):
+            lines.append("No changes between the two runs.", "")
     return "\n".join(lines)
 
 def main():
     ap = argparse.ArgumentParser(description="Agent environment diagnostic (read-only)")
     ap.add_argument("project_dir", nargs="?", default=os.getcwd())
     ap.add_argument("--output", default=None, help="Directory for reports (default: <project_dir>/env_diag_reports)")
+    ap.add_argument("--compare", metavar="OLD_REPORT.json",
+                    help="Compare with a previous JSON report (new/resolved/persisting)")
     ap.add_argument("--json", action="store_true", help="Also print JSON to stdout")
     args = ap.parse_args()
 
     report = build_report(args.project_dir)
+    if args.compare:
+        if not os.path.exists(args.compare):
+            print("Compare failed: old report not found: %s" % args.compare)
+            sys.exit(2)
+        try:
+            report["compare"] = compare_reports(report, args.compare)
+        except Exception as e:
+            print("Compare failed: old report unreadable (%s)" % type(e).__name__)
+            sys.exit(2)
+
     outdir = args.output or os.path.join(args.project_dir, "env_diag_reports")
     os.makedirs(outdir, exist_ok=True)
     md_path = os.path.join(outdir, "env_diagnostic_report.md")
@@ -431,6 +534,10 @@ def main():
     print("Agent environment diagnostic complete.")
     print("  high: %d | medium: %d | low: %d | info: %d" % (
         s["high"], s["medium"], s["low"], s["info"]))
+    cmp_ = report.get("compare")
+    if cmp_:
+        print("  compare: %d new | %d resolved | %d persisting" % (
+            len(cmp_["new"]), len(cmp_["resolved"]), len(cmp_["persisting"])))
     print("Report: %s" % md_path)
     print("        %s" % js_path)
     if args.json:
